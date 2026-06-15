@@ -1,0 +1,11 @@
+flask
+flask-cors
+requests
+PyQt6
+edge-tts
+sounddevice
+scipy
+numpy
+SpeechRecognition
+PyAudio
+pygame 
