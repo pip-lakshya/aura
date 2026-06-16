@@ -162,7 +162,7 @@ def speak(
     try:
         asyncio.run(_speak_async(text))
         if not _SPEECH_STOP_EVENT.is_set():
-            _play_audio("tts_out.mp3", on_level)
+            _play_audio("scratch/tts_out.mp3", on_level)
     finally:
         if on_end:
             on_end()
@@ -171,7 +171,7 @@ def speak(
 async def _speak_async(text: str) -> None:
     import edge_tts
     communicate = edge_tts.Communicate(text, voice=EDGE_TTS_VOICE)
-    await communicate.save("tts_out.mp3")
+    await communicate.save("scratch/tts_out.mp3")
 
 
 def _play_audio(path: str, on_level: Callable[[float, float], None] | None = None) -> None:

@@ -40,6 +40,17 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt6.QtGui import QIcon
+import os
+import sys
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
 
 BG_COLOR = "#0a0a0f"
 ACCENT = "#00d4ff"
@@ -577,6 +588,7 @@ class AuraWindow(QMainWindow):
         self.resize_margin = 8
 
         self.setWindowTitle("AURA")
+        self.setWindowIcon(QIcon(resource_path("assets/logo.png")))
         self.resize(1200, 700)
         self.setMinimumSize(1200, 700)
         self.setWindowFlags(

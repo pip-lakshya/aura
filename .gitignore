@@ -1,8 +1,12 @@
 .env
+.vscode/
 venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 aura_memory.db
 aura_voice_input.wav
-tts_out.mp3
 scratch/
+dist/
+build/
+*.spec

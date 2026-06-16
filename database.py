@@ -8,9 +8,19 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import os
+import sys
+from pathlib import Path
 
+def get_base_path():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
 
-DB_PATH = Path(__file__).with_name("aura_memory.db")
+BASE_DIR = get_base_path()
+
+DB_PATH = BASE_DIR / "aura_memory.db"
+
 SEARCH_STOPWORDS = {
     "a",
     "about",
