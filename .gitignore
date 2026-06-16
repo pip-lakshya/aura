@@ -5,3 +5,4 @@ __pycache__/
 aura_memory.db
 aura_voice_input.wav
 tts_out.mp3
+scratch/

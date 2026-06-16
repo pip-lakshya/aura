@@ -111,6 +111,16 @@ def init_db() -> dict[str, Any]:
                 timestamp TEXT NOT NULL,
                 results TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS knowledge_triples (
+                triple_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                target TEXT NOT NULL,
+                memory_id INTEGER,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (memory_id) REFERENCES memories(memory_id) ON DELETE CASCADE
+            );
             """
         )
     return {"success": True, "database": str(DB_PATH)}
@@ -273,3 +283,40 @@ def log_retrieval(query: str, results: Any) -> dict[str, Any]:
         "timestamp": timestamp,
         "results": results,
     }
+
+
+def save_triple(
+    source: str,
+    relation: str,
+    target: str,
+    memory_id: int | None = None,
+) -> dict[str, Any]:
+    """Insert a knowledge triple relationship into the database."""
+    timestamp = _now()
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO knowledge_triples (source, relation, target, memory_id, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (source.strip(), relation.strip(), target.strip(), memory_id, timestamp),
+        )
+        triple_id = cursor.lastrowid
+    return {
+        "triple_id": triple_id,
+        "source": source,
+        "relation": relation,
+        "target": target,
+        "memory_id": memory_id,
+        "timestamp": timestamp,
+    }
+
+
+def get_all_triples() -> list[dict[str, Any]]:
+    """Return all saved knowledge triples."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM knowledge_triples ORDER BY timestamp DESC, triple_id DESC"
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+

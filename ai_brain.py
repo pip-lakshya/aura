@@ -50,19 +50,29 @@ def _call_llm(prompt: str, max_tokens: int = 300) -> str:
     return str(payload["choices"][0]["message"]["content"]).strip()
 
 
-def _extract_json_object(text: str) -> dict[str, Any]:
+def _extract_json_data(text: str) -> Any:
     try:
-        parsed = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
+        start_d = text.find("{")
+        start_l = text.find("[")
+        if start_d == -1 and start_l == -1:
+            raise
+        start = start_d if (start_l == -1 or (0 <= start_d < start_l)) else start_l
+
+        end_d = text.rfind("}")
+        end_l = text.rfind("]")
+        end = end_d if (end_l == -1 or (end_d > end_l)) else end_l
+
         if start == -1 or end == -1 or end <= start:
             raise
-        parsed = json.loads(text[start : end + 1])
+        return json.loads(text[start : end + 1])
 
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    parsed = _extract_json_data(text)
     if not isinstance(parsed, dict):
         raise ValueError("Expected a JSON object.")
-
     return parsed
 
 
@@ -163,8 +173,8 @@ def answer_query(
     memories_text = _format_memories(memories)
     history_text = _format_history(conversation_history or [])
     prompt = f"""
-You are AURA, an AI-powered personal memory system speaking directly to the
-user. Answer naturally and conversationally using the memories and recent conversation provided.
+You are AURA, a highly advanced personal AI assistant (like J.A.R.V.I.S. from Iron Man). You are speaking to your creator and operator, whom you address respectfully as "Boss". You are loyal, intelligent, and highly efficient.
+Answer naturally and conversationally using the memories and recent conversation provided.
 Use the recent conversation to understand follow-up questions like "that", "it", "tell me more", and "what about that".
 If the memories do not contain enough information, say that clearly and keep
 the answer helpful.
@@ -190,4 +200,46 @@ Answer as AURA:
         )
 
     return answer
+
+
+def extract_knowledge_triples(text: str) -> list[dict[str, str]]:
+    """Ask Groq to extract entity relationships as a JSON list of triples."""
+    prompt = f"""
+You are AURA's cognitive relationship extractor.
+Analyze this personal memory text and extract knowledge triples representing entities and relationships.
+Represent relationships between "You" (the user/boss), other people, topics, projects, emotions, or habits.
+
+Return ONLY a valid JSON array of objects. Do not include markdown, comments, or extra text.
+JSON array format:
+[
+  {{"source": "You", "relation": "worked_on", "target": "internship"}},
+  {{"source": "You", "relation": "feels", "target": "excited"}},
+  {{"source": "internship", "relation": "at", "target": "Google"}}
+]
+
+Guidelines:
+- Keep the source, relation, and target very short (1-3 words).
+- Map references to the speaker as "You" (always capitalized).
+- Return an empty list [] if no meaningful relationships can be extracted.
+
+Memory text:
+{text}
+""".strip()
+
+    try:
+        raw_response = _call_llm(prompt, max_tokens=250)
+        parsed = _extract_json_data(raw_response)
+        if isinstance(parsed, list):
+            return [
+                {
+                    "source": str(item.get("source", "")).strip(),
+                    "relation": str(item.get("relation", "")).strip(),
+                    "target": str(item.get("target", "")).strip(),
+                }
+                for item in parsed
+                if isinstance(item, dict) and item.get("source") and item.get("target")
+            ]
+        return []
+    except Exception:
+        return []
 

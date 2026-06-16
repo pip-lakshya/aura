@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 
 import sqlite3
 
-from database import DB_PATH, init_db, save_memory
+from database import DB_PATH, init_db, save_memory, save_triple
+from ai_brain import extract_knowledge_triples
 
 
 DEMO_MEMORIES = [
@@ -24,7 +25,7 @@ DEMO_MEMORIES = [
         "backend learning",
         "study",
         "curious",
-        7,
+        7,  
         ["flask", "backend", "study"],
         3,
     ),
@@ -151,6 +152,12 @@ DEMO_MEMORIES = [
 def seed() -> None:
     init_db()
 
+    # Clear existing knowledge triples and memories to prevent seeding duplicate graph data
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM memories")
+        conn.execute("DELETE FROM knowledge_triples")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('memories', 'knowledge_triples')")
+
     for content, topic, category, emotion, importance, tags, days_ago in DEMO_MEMORIES:
         memory = save_memory(
             content=content,
@@ -164,14 +171,30 @@ def seed() -> None:
             timespec="seconds"
         )
 
+        memory_id = memory["memory_id"]
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
                 "UPDATE memories SET timestamp = ? WHERE memory_id = ?",
-                (timestamp, memory["memory_id"]),
+                (timestamp, memory_id),
             )
 
-    print(f"Seeded {len(DEMO_MEMORIES)} demo memories into {DB_PATH}.")
+        # Extract knowledge triples and save them
+        print(f"Extracting graph relationships for: '{content[:40]}...'")
+        triples = extract_knowledge_triples(content)
+        for t in triples:
+            try:
+                saved = save_triple(t["source"], t["relation"], t["target"], memory_id)
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute(
+                        "UPDATE knowledge_triples SET timestamp = ? WHERE triple_id = ?",
+                        (timestamp, saved["triple_id"]),
+                    )
+            except Exception as e:
+                print(f"Failed to save triple {t}: {e}")
+
+    print(f"Seeded {len(DEMO_MEMORIES)} demo memories and relationships into {DB_PATH}.")
 
 
 if __name__ == "__main__":
     seed()
+

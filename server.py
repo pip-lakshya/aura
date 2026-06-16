@@ -6,7 +6,7 @@ from typing import Any
 
 from flask import Flask, jsonify, request
 
-from ai_brain import answer_query, tag_memory
+from ai_brain import answer_query, tag_memory, extract_knowledge_triples
 from database import (
     get_all_memories,
     get_stats,
@@ -14,6 +14,8 @@ from database import (
     log_retrieval,
     save_memory,
     search_memories,
+    save_triple,
+    get_all_triples,
 )
 
 
@@ -66,7 +68,7 @@ def create_memory():
         return _json_error("Missing required field: text.")
 
     tags = tag_memory(text)
-    save_memory(
+    memory = save_memory(
         content=text,
         topic=tags.get("topic", ""),
         category=tags.get("category", ""),
@@ -75,7 +77,16 @@ def create_memory():
         tags_list=_tags_list(tags),
     )
 
-    return jsonify({"status": "saved", "tags": tags})
+    # Extract and store knowledge triples
+    memory_id = memory.get("memory_id")
+    triples = extract_knowledge_triples(text)
+    for t in triples:
+        try:
+            save_triple(t["source"], t["relation"], t["target"], memory_id)
+        except Exception:
+            pass
+
+    return jsonify({"status": "saved", "tags": tags, "triples": triples})
 
 
 @app.route("/query", methods=["POST", "OPTIONS"])
@@ -120,6 +131,12 @@ def stats():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/graph", methods=["GET"])
+def get_graph():
+    return jsonify(get_all_triples())
+
 
 
 if __name__ == "__main__":

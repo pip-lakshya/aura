@@ -18,8 +18,13 @@ load_env()
 import server
 from database import init_db
 from ui import AuraWindow
-from voice import listen_and_transcribe, speak, start_wake_word_loop, stop_speaking
-
+from voice import (
+    speak,
+    stop_speaking,
+    AuraAudioEngine,
+    transcribe_audio,
+    _get_sr_device_index,
+)
 
 API_URL = "http://127.0.0.1:5000"
 QUESTION_STARTS = (
@@ -60,6 +65,12 @@ class UiBridge(QObject):
     set_input = pyqtSignal(str)
     set_status = pyqtSignal(str)
     process_text = pyqtSignal(str)
+
+    # HUD status and analytics signals
+    update_mic_level = pyqtSignal(float, float)  # (rms, peak)
+    update_spk_level = pyqtSignal(float, float)  # (rms, peak)
+    update_graph = pyqtSignal(list)              # list of triples
+    set_caption = pyqtSignal(str)
 
 
 def is_question(text: str) -> bool:
@@ -128,10 +139,27 @@ def post_to_aura(text: str) -> str:
     return "Memory saved."
 
 
-def handle_text(text: str, bridge: UiBridge, speak_response: bool = True) -> None:
+def refresh_graph(bridge: UiBridge) -> None:
+    """Fetch all triples from server and update UI graph."""
+    try:
+        response = requests.get(f"{API_URL}/graph", timeout=5)
+        if response.ok:
+            bridge.update_graph.emit(response.json())
+    except Exception:
+        pass
+
+
+def handle_text(
+    text: str,
+    bridge: UiBridge,
+    window: AuraWindow,
+    audio_engine: AuraAudioEngine,
+    speak_response: bool = True,
+) -> None:
     input_text = text.strip()
     if not input_text:
         bridge.set_status.emit("IDLE")
+        audio_engine.set_state("wake_word")
         return
 
     bridge.add_message.emit("user", input_text)
@@ -146,57 +174,46 @@ def handle_text(text: str, bridge: UiBridge, speak_response: bool = True) -> Non
     bridge.add_message.emit("aura", answer)
     _remember_turn("assistant", answer)
 
-    if speak_response:
+    # Always refresh knowledge graph nodes after updates
+    refresh_graph(bridge)
+
+    # Only speak if not muted in the UI
+    if speak_response and not window.is_muted():
         bridge.set_status.emit("SPEAKING")
+        bridge.set_caption.emit(answer)
         try:
             speak(
                 answer,
                 on_start=None,
-                on_end=lambda: bridge.set_status.emit("IDLE"),
+                on_end=lambda: (
+                    bridge.set_status.emit("IDLE"),
+                    bridge.update_spk_level.emit(0.0, 0.0),
+                    audio_engine.set_state("wake_word") # resume wake word listening
+                ),
+                on_level=lambda rms, peak: bridge.update_spk_level.emit(rms, peak),
             )
         except Exception as exc:
             bridge.add_message.emit("aura", f"Speech output is unavailable: {exc}")
             bridge.set_status.emit("IDLE")
+            bridge.update_spk_level.emit(0.0, 0.0)
+            audio_engine.set_state("wake_word")
     else:
         bridge.set_status.emit("IDLE")
+        bridge.update_spk_level.emit(0.0, 0.0)
+        audio_engine.set_state("wake_word") # resume wake word listening
 
 
-def start_text_worker(text: str, bridge: UiBridge, speak_response: bool = True) -> None:
+def start_text_worker(
+    text: str,
+    bridge: UiBridge,
+    window: AuraWindow,
+    audio_engine: AuraAudioEngine,
+    speak_response: bool = True,
+) -> None:
     thread = threading.Thread(
         target=handle_text,
-        args=(text, bridge, speak_response),
+        args=(text, bridge, window, audio_engine, speak_response),
         name="aura-text-worker",
-        daemon=True,
-    )
-    thread.start()
-
-
-def handle_wake_activation(bridge: UiBridge) -> None:
-    bridge.set_status.emit("LISTENING")
-
-    try:
-        input_text = listen_and_transcribe()
-    except Exception as exc:
-        bridge.add_message.emit("aura", f"Voice input failed: {exc}")
-        bridge.set_status.emit("IDLE")
-        return
-
-    if not input_text:
-        bridge.add_message.emit("aura", "I did not hear clear speech.")
-        bridge.set_status.emit("IDLE")
-        return
-
-    bridge.set_input.emit(input_text)
-    time.sleep(0.4)
-    handle_text(input_text, bridge, speak_response=True)
-    bridge.set_input.emit("")
-
-
-def start_voice_input_worker(bridge: UiBridge) -> None:
-    thread = threading.Thread(
-        target=handle_wake_activation,
-        args=(bridge,),
-        name="aura-voice-worker",
         daemon=True,
     )
     thread.start()
@@ -210,31 +227,91 @@ def main() -> int:
     window = AuraWindow()
     bridge = UiBridge()
 
+    # Bridge signal wiring
     bridge.add_message.connect(window.add_message)
     bridge.set_input.connect(window.set_input_text)
     bridge.set_status.connect(window.set_status)
-    bridge.process_text.connect(lambda text: start_text_worker(text, bridge, True))
-    window.message_submitted.connect(bridge.process_text.emit)
-    window.mic_requested.connect(lambda: start_voice_input_worker(bridge))
-    window.stop_requested.connect(lambda: (stop_speaking(), bridge.set_status.emit("IDLE")))
+    bridge.set_caption.connect(window.set_caption)
+    bridge.update_mic_level.connect(window.update_mic_level)
+    bridge.update_spk_level.connect(window.update_spk_level)
+    bridge.update_graph.connect(window.graph_widget.set_triples)
 
-    window.add_message("AURA", "Systems online. I am ready.")
+    # Single persistent audio engine setup
+    device_index = _get_sr_device_index()
+    audio_engine = AuraAudioEngine(device_index=device_index, sample_rate=48000)
+
+    # Wire text submission
+    bridge.process_text.connect(lambda text: start_text_worker(text, bridge, window, audio_engine, True))
+    window.message_submitted.connect(bridge.process_text.emit)
+
+    # Wire wake word callback
+    def on_wake():
+        # Stop any active speaking before starting transcription
+        stop_speaking()
+        bridge.set_status.emit("LISTENING")
+        audio_engine.set_state("recording")
+
+    # Wire voice transcription callback
+    def on_record_done(audio):
+        bridge.set_status.emit("TRANSCRIBING")
+        try:
+            text = transcribe_audio(audio)
+            if text:
+                bridge.set_input.emit(text)
+                time.sleep(0.4)
+                start_text_worker(text, bridge, window, audio_engine, True)
+                bridge.set_input.emit("")
+            else:
+                bridge.add_message.emit("aura", "I did not hear clear speech.")
+                bridge.set_status.emit("IDLE")
+                audio_engine.set_state("wake_word")
+        except Exception as exc:
+            bridge.add_message.emit("aura", f"Voice input failed: {exc}")
+            bridge.set_status.emit("IDLE")
+            audio_engine.set_state("wake_word")
+
+    # Start the single persistent audio engine
+    audio_engine.start(
+        on_level=lambda rms, peak: bridge.update_mic_level.emit(rms, peak),
+        on_wake=on_wake,
+        on_record_done=on_record_done
+    )
+
+    # Set state initially to listen for the wake word
+    audio_engine.set_state("wake_word")
+
+    # Wire MIC button to toggle recording state
+    window.mic_requested.connect(lambda: (
+        stop_speaking(),
+        bridge.set_status.emit("LISTENING"),
+        audio_engine.set_state("recording")
+    ))
+
+    # Wire STOP button to halt speech and go back to wake word monitoring
+    window.stop_requested.connect(lambda: (
+        stop_speaking(),
+        bridge.set_status.emit("IDLE"),
+        audio_engine.set_state("wake_word")
+    ))
+
+    window.add_message("AURA", "Systems online. I am ready, Boss.")
+
+    # Clean shutdown hook for audio engine on close
+    original_close = window.closeEvent
+    def new_close_event(event):
+        audio_engine.stop()
+        stop_speaking()
+        original_close(event)
+    window.closeEvent = new_close_event
 
     if wait_for_server():
         window.add_message("AURA", "Local memory server connected.")
+        # Load initial graph state
+        refresh_graph(bridge)
     else:
         window.add_message("AURA", "Local memory server is still starting.")
 
-    try:
-        start_wake_word_loop(
-            lambda: start_voice_input_worker(bridge),
-            on_error=lambda message: bridge.add_message.emit(
-                "aura", f"Wake-word error: {message}"
-            ),
-        )
-        window.add_message("AURA", "Wake-word listener started.")
-    except Exception as exc:
-        window.add_message("AURA", f"Wake-word listening is unavailable: {exc}")
+    window.add_message("AURA", "Wake-word listener started.")
 
     window.show()
     return app.exec()

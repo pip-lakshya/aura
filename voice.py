@@ -1,4 +1,4 @@
-"""Voice input, output, and wake-word helpers for AURA."""
+"""Voice input, output, and wake-word helpers for AURA using a single persistent audio stream."""
 
 from __future__ import annotations
 
@@ -8,20 +8,19 @@ import os
 import tempfile
 import threading
 import time
-from array import array
-from typing import Callable
-
-_SPEECH_STOP_EVENT = threading.Event()
+from typing import Callable, Any
 
 import requests
+import pyaudio
+import numpy as np
+import speech_recognition as sr
+import pygame
 
 from config import load_env
 
-
 load_env()
 
-SAMPLE_RATE = int(os.getenv("AURA_SAMPLE_RATE", "16000"))
-CHANNELS = 1
+SAMPLE_RATE = int(os.getenv("AURA_SAMPLE_RATE", "48000"))
 WAKE_WORD_VARIANTS = (
     "aura",
     "hey aura",
@@ -42,112 +41,63 @@ GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 EDGE_TTS_VOICE = os.getenv("AURA_TTS_VOICE", "en-US-AriaNeural")
 AURA_INPUT_DEVICE = os.getenv("AURA_INPUT_DEVICE", "").strip()
-MIN_AUDIO_PEAK = float(os.getenv("AURA_MIN_AUDIO_PEAK", "0.002"))
-MAX_AUDIO_RMS = float(os.getenv("AURA_MAX_AUDIO_RMS", "0.40"))
-MAX_AUDIO_PEAK = float(os.getenv("AURA_MAX_AUDIO_PEAK", "0.995"))
-MIC_RECORD_SECONDS = float(os.getenv("AURA_MIC_RECORD_SECONDS", "10"))
-AURA_LISTEN_TIMEOUT = float(os.getenv("AURA_LISTEN_TIMEOUT", "8"))
-WAKE_CHUNK_SECONDS = float(os.getenv("AURA_WAKE_CHUNK_SECONDS", "1.4"))
 WAKE_COOLDOWN_SECONDS = float(os.getenv("AURA_WAKE_COOLDOWN_SECONDS", "1.5"))
-WAKE_PHRASE_SECONDS = float(os.getenv("AURA_WAKE_PHRASE_SECONDS", "1.35"))
-WAKE_LISTEN_TIMEOUT = float(os.getenv("AURA_WAKE_LISTEN_TIMEOUT", "0.25"))
-WAKE_RECOGNITION_TIMEOUT = float(os.getenv("AURA_WAKE_RECOGNITION_TIMEOUT", "1.2"))
 
-
-def _rms_from_values(values: array) -> float:
-    if not values:
-        return 0.0
-    total = sum(sample * sample for sample in values)
-    return math.sqrt(total / len(values)) / 32768.0
-
-
-def _audio_levels_from_raw(raw_data: bytes) -> dict[str, float]:
-    if not raw_data:
-        return {"rms": 0.0, "peak": 0.0}
-
-    values = array("h")
-    values.frombytes(raw_data)
-    if not values:
-        return {"rms": 0.0, "peak": 0.0}
-
-    peak = max(abs(sample) for sample in values) / 32768.0
-    return {"rms": _rms_from_values(values), "peak": peak}
+_SPEECH_STOP_EVENT = threading.Event()
 
 
 def _get_sr_device_index() -> int | None:
-    import speech_recognition as sr
-
     value = os.getenv("AURA_INPUT_DEVICE", "").strip()
     if value.isdigit():
         return int(value)
 
-    names = sr.Microphone.list_microphone_names()
-    for index, name in enumerate(names):
-        lowered = name.lower()
-        if "microphone array" in lowered or "microphone" in lowered:
-            return index
+    try:
+        p = pyaudio.PyAudio()
+        names = [p.get_device_info_by_index(i).get("name", "").lower() for i in range(p.get_device_count())]
+        p.terminate()
+        for index, name in enumerate(names):
+            if "microphone array" in name or "microphone" in name:
+                return index
+    except Exception:
+        pass
 
     return None
 
 
 def list_audio_devices() -> str:
-    """Return input/output devices seen by sounddevice and SpeechRecognition."""
+    """Return input/output devices seen by sounddevice and PyAudio."""
     lines = []
-
     try:
         import sounddevice as sd
-
         lines.append("sounddevice devices:")
         lines.append(str(sd.query_devices()))
     except Exception as exc:
         lines.append(f"sounddevice unavailable: {exc}")
 
     try:
-        import speech_recognition as sr
-
-        lines.append("SpeechRecognition microphones:")
-        for index, name in enumerate(sr.Microphone.list_microphone_names()):
-            marker = "*" if index == _get_sr_device_index() else " "
-            lines.append(f"{marker} {index}: {name}")
+        p = pyaudio.PyAudio()
+        lines.append("PyAudio input devices:")
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info.get("maxInputChannels", 0) > 0:
+                marker = "*" if i == _get_sr_device_index() else " "
+                lines.append(f"{marker} {i}: {info.get('name')}")
+        p.terminate()
     except Exception as exc:
-        lines.append(f"SpeechRecognition unavailable: {exc}")
+        lines.append(f"PyAudio unavailable: {exc}")
 
     return "\n".join(lines)
 
 
-def measure_microphone_level(seconds: float = 3.0) -> dict[str, float | int | None]:
-    """Record a fixed window through SpeechRecognition/PyAudio and measure it."""
-    import speech_recognition as sr
-
-    device_index = _get_sr_device_index()
-    recognizer = sr.Recognizer()
-
-    with sr.Microphone(device_index=device_index, sample_rate=SAMPLE_RATE) as source:
-        audio = recognizer.record(source, duration=seconds)
-
-    raw_data = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
-    levels = _audio_levels_from_raw(raw_data)
-    return {
-        "rms": levels["rms"],
-        "peak": levels["peak"],
-        "minimum_peak": MIN_AUDIO_PEAK,
-        "maximum_rms": MAX_AUDIO_RMS,
-        "maximum_peak": MAX_AUDIO_PEAK,
-        "device_index": device_index,
-        "sample_rate": SAMPLE_RATE,
-    }
-
-
 def _beep() -> None:
     try:
-        import numpy as np
-        import sounddevice as sd
-
         duration = 0.16
         frequency = 880
-        samples = np.linspace(0, duration, int(SAMPLE_RATE * duration), False)
+        samples = np.linspace(0, duration, int(16000 * duration), False)
         tone = 0.25 * np.sin(2 * np.pi * frequency * samples)
-        sd.play(tone, SAMPLE_RATE)
+        # Play tone via sounddevice
+        import sounddevice as sd
+        sd.play(tone, 16000)
         sd.wait()
     except Exception:
         pass
@@ -180,42 +130,9 @@ def _transcribe_wav_bytes(wav_data: bytes) -> str:
             pass
 
 
-def listen_and_transcribe(on_recorded: Callable[[], None] | None = None) -> str:
-    """Listen for a phrase, reject bad captures, then transcribe with Groq."""
-    import speech_recognition as sr
-
-    device_index = _get_sr_device_index()
-    recognizer = sr.Recognizer()
-    recognizer.dynamic_energy_threshold = True
-    recognizer.pause_threshold = 0.9
-    recognizer.non_speaking_duration = 0.4
-
-    with sr.Microphone(device_index=device_index, sample_rate=SAMPLE_RATE) as source:
-        recognizer.adjust_for_ambient_noise(source, duration=0.8)
-        audio = recognizer.listen(
-            source,
-            timeout=AURA_LISTEN_TIMEOUT,
-            phrase_time_limit=MIC_RECORD_SECONDS,
-        )
-
-    raw_data = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
-    levels = _audio_levels_from_raw(raw_data)
-    if levels["peak"] < MIN_AUDIO_PEAK:
-        raise RuntimeError(
-            f"Mic audio too quiet. Peak={levels['peak']:.6f}, "
-            f"minimum={MIN_AUDIO_PEAK:.6f}, device={device_index}."
-        )
-    if levels["rms"] > MAX_AUDIO_RMS and levels["peak"] >= MAX_AUDIO_PEAK:
-        raise RuntimeError(
-            f"Mic audio is clipping/noisy. RMS={levels['rms']:.3f}, "
-            f"peak={levels['peak']:.3f}, device={device_index}. "
-            "Lower Windows input volume or try AURA_INPUT_DEVICE=1 or 9."
-        )
-
-    if on_recorded:
-        on_recorded()
-
-    text = _transcribe_wav_bytes(audio.get_wav_data(convert_rate=SAMPLE_RATE))
+def transcribe_audio(audio: sr.AudioData) -> str:
+    """Transcribe standard AudioData using Groq Whisper (downsampled to 16000Hz)."""
+    text = _transcribe_wav_bytes(audio.get_wav_data(convert_rate=16000))
     if text.lower().strip() in {"", "you", "thank you", "thanks"}:
         return ""
     return text
@@ -225,8 +142,6 @@ def stop_speaking() -> None:
     """Stop current TTS playback as quickly as possible."""
     _SPEECH_STOP_EVENT.set()
     try:
-        import pygame
-
         if pygame.mixer.get_init():
             pygame.mixer.music.stop()
     except Exception:
@@ -237,6 +152,7 @@ def speak(
     text: str,
     on_start: Callable[[], None] | None = None,
     on_end: Callable[[], None] | None = None,
+    on_level: Callable[[float, float], None] | None = None,
 ) -> None:
     """Speak text with edge-tts and embedded pygame playback."""
     _SPEECH_STOP_EVENT.clear()
@@ -246,7 +162,7 @@ def speak(
     try:
         asyncio.run(_speak_async(text))
         if not _SPEECH_STOP_EVENT.is_set():
-            _play_audio("tts_out.mp3")
+            _play_audio("tts_out.mp3", on_level)
     finally:
         if on_end:
             on_end()
@@ -254,22 +170,48 @@ def speak(
 
 async def _speak_async(text: str) -> None:
     import edge_tts
-
     communicate = edge_tts.Communicate(text, voice=EDGE_TTS_VOICE)
     await communicate.save("tts_out.mp3")
 
 
-def _play_audio(path: str) -> None:
-    import pygame
-
+def _play_audio(path: str, on_level: Callable[[float, float], None] | None = None) -> None:
     pygame.mixer.init()
+
+    samples = None
+    try:
+        sound = pygame.mixer.Sound(path)
+        samples = pygame.sndarray.array(sound)
+        if len(samples.shape) > 1:
+            samples = samples.mean(axis=1)
+    except Exception:
+        pass
+
     pygame.mixer.music.load(path)
     pygame.mixer.music.play()
+
+    start_time = time.time()
+    mixer_init = pygame.mixer.get_init()
+    actual_rate = mixer_init[0] if mixer_init else 44100
+
     while pygame.mixer.music.get_busy() and not _SPEECH_STOP_EVENT.is_set():
+        if samples is not None and on_level:
+            elapsed = time.time() - start_time
+            idx = int(elapsed * actual_rate)
+            if idx < len(samples):
+                window = samples[idx : idx + 1024]
+                if len(window) > 0:
+                    peak = float(np.max(np.abs(window))) / 32768.0
+                    rms = float(np.sqrt(np.mean(window.astype(float) ** 2))) / 32768.0
+                    on_level(rms, peak)
+            else:
+                on_level(0.0, 0.0)
         time.sleep(0.03)
+
     if _SPEECH_STOP_EVENT.is_set():
         pygame.mixer.music.stop()
     pygame.mixer.music.unload()
+    if on_level:
+        on_level(0.0, 0.0)
 
 
 def _has_wake_word(transcript: str) -> bool:
@@ -277,69 +219,188 @@ def _has_wake_word(transcript: str) -> bool:
     return any(variant in normalized for variant in WAKE_WORD_VARIANTS)
 
 
-def start_wake_word_loop(
-    on_activated: Callable[[], None],
-    on_error: Callable[[str], None] | None = None,
-) -> threading.Thread:
-    """Start a fast non-blocking wake-word listener."""
-    import speech_recognition as sr
+class AuraAudioEngine:
+    """Single persistent float32 WASAPI microphone capture and routing engine."""
 
-    def loop() -> None:
-        device_index = _get_sr_device_index()
-        recognizer = sr.Recognizer()
-        recognizer.dynamic_energy_threshold = True
-        recognizer.operation_timeout = WAKE_RECOGNITION_TIMEOUT
-        recognizer.pause_threshold = 0.25
-        recognizer.non_speaking_duration = 0.2
-        last_activation = 0.0
-        last_error = 0.0
+    def __init__(self, device_index: int | None, sample_rate: int = 48000) -> None:
+        self.device_index = device_index
+        self.sample_rate = sample_rate
+        self.running = False
+        self.thread: threading.Thread | None = None
 
-        try:
-            mic = sr.Microphone(device_index=device_index, sample_rate=SAMPLE_RATE)
-        except Exception as exc:
-            if on_error:
-                on_error(str(exc))
-            return
+        # Callbacks
+        self.on_level_callback: Callable[[float, float], None] | None = None
+        self.on_wake_word_callback: Callable[[], None] | None = None
+        self.on_recording_complete_callback: Callable[[sr.AudioData], None] | None = None
 
-        with mic as source:
+        # States: 'idle', 'wake_word', 'recording'
+        self.state = "idle"
+        self.state_lock = threading.Lock()
+
+        # VAD Parameters
+        self.threshold = 0.002
+        self.recorded_chunks: list[np.ndarray] = []
+        self.silence_timer = 0.0
+        self.max_record_seconds = 10.0
+        self.pause_threshold = 0.9
+
+    def start(
+        self,
+        on_level: Callable[[float, float], None],
+        on_wake: Callable[[], None],
+        on_record_done: Callable[[sr.AudioData], None],
+    ) -> None:
+        self.on_level_callback = on_level
+        self.on_wake_word_callback = on_wake
+        self.on_recording_complete_callback = on_record_done
+        self.running = True
+        self.thread = threading.Thread(target=self._run, name="aura-audio-engine", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+            self.thread = None
+
+    def set_state(self, new_state: str) -> None:
+        with self.state_lock:
+            if new_state == "recording":
+                self.recorded_chunks = []
+                self.silence_timer = 0.0
+            self.state = new_state
+
+    def _run(self) -> None:
+        p = pyaudio.PyAudio()
+        while self.running:
+            stream = None
             try:
-                recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            except Exception:
-                pass
-
-            while True:
                 try:
-                    audio = recognizer.listen(
-                        source,
-                        timeout=WAKE_LISTEN_TIMEOUT,
-                        phrase_time_limit=WAKE_PHRASE_SECONDS,
-                    )
-                    raw_data = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
-                    levels = _audio_levels_from_raw(raw_data)
-                    if levels["peak"] < MIN_AUDIO_PEAK:
-                        continue
-                    if levels["rms"] > MAX_AUDIO_RMS and levels["peak"] >= MAX_AUDIO_PEAK:
-                        continue
+                    dev_info = p.get_device_info_by_index(self.device_index) if self.device_index is not None else p.get_default_input_device_info()
+                    channels = int(dev_info.get("maxInputChannels", 2))
+                except Exception:
+                    channels = 2
 
+                stream = p.open(
+                    format=pyaudio.paFloat32,
+                    channels=channels,
+                    rate=self.sample_rate,
+                    input=True,
+                    input_device_index=self.device_index,
+                    frames_per_buffer=1024,
+                )
+
+                # Estimate ambient noise
+                ambient_frames = []
+                for _ in range(int(self.sample_rate / 1024 * 0.4)):
+                    data = stream.read(1024, exception_on_overflow=False)
+                    samples = np.frombuffer(data, dtype=np.float32)
+                    if channels > 1:
+                        samples = samples.reshape(-1, channels).mean(axis=1)
+                    ambient_frames.append(samples)
+
+                if ambient_frames:
+                    all_amb = np.concatenate(ambient_frames)
+                    ambient_rms = float(np.sqrt(np.mean(all_amb ** 2)))
+                else:
+                    ambient_rms = 0.001
+                self.threshold = max(0.0025, ambient_rms * 2.2)
+
+                # Sliding history for wake word (pre-roll)
+                history = []
+                history_len = int(self.sample_rate / 1024 * 1.35)
+                chunk_dur = 1024 / self.sample_rate
+
+                recognizer = sr.Recognizer()
+                last_activation = 0.0
+
+                while self.running:
                     try:
-                        text = recognizer.recognize_google(audio).lower()
+                        data = stream.read(1024, exception_on_overflow=False)
+                        if not data:
+                            continue
+                        samples = np.frombuffer(data, dtype=np.float32)
+                        if channels > 1:
+                            samples = samples.reshape(-1, channels).mean(axis=1)
+
+                        rms = float(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0.0
+                        peak = float(np.max(np.abs(samples))) if len(samples) > 0 else 0.0
+
+                        # Emit live level to UI
+                        if self.on_level_callback:
+                            self.on_level_callback(rms, peak)
+
+                        with self.state_lock:
+                            current_state = self.state
+
+                        if current_state == "wake_word":
+                            history.append(samples)
+                            if len(history) > history_len:
+                                history.pop(0)
+
+                            if rms > self.threshold:
+                                # Capture audio block for wake word check
+                                phrase_frames = list(history)
+                                for _ in range(int(self.sample_rate / 1024 * 1.1)):
+                                    d = stream.read(1024, exception_on_overflow=False)
+                                    s = np.frombuffer(d, dtype=np.float32)
+                                    if channels > 1:
+                                        s = s.reshape(-1, channels).mean(axis=1)
+                                    phrase_frames.append(s)
+
+                                all_s = np.concatenate(phrase_frames)
+                                all_s = np.clip(all_s, -1.0, 1.0)
+                                pcm = (all_s * 32767.0).astype(np.int16).tobytes()
+                                audio = sr.AudioData(pcm, self.sample_rate, 2)
+
+                                try:
+                                    text = recognizer.recognize_google(audio).lower()
+                                    now = time.time()
+                                    if _has_wake_word(text) and now - last_activation >= WAKE_COOLDOWN_SECONDS:
+                                        last_activation = now
+                                        _beep()
+                                        if self.on_wake_word_callback:
+                                            self.on_wake_word_callback()
+                                except Exception:
+                                    pass
+                                history.clear()
+                                time.sleep(0.3)
+
+                        elif current_state == "recording":
+                            self.recorded_chunks.append(samples)
+                            if rms > self.threshold:
+                                self.silence_timer = 0.0
+                            else:
+                                self.silence_timer += chunk_dur
+
+                            total_dur = len(self.recorded_chunks) * chunk_dur
+                            if self.silence_timer > self.pause_threshold or total_dur > self.max_record_seconds:
+                                # Convert to AudioData
+                                all_samples = np.concatenate(self.recorded_chunks)
+                                all_samples = np.clip(all_samples, -1.0, 1.0)
+                                pcm_data = (all_samples * 32767.0).astype(np.int16).tobytes()
+                                audio = sr.AudioData(pcm_data, self.sample_rate, 2)
+
+                                # Revert back to wake word monitoring
+                                self.state = "wake_word"
+
+                                if self.on_recording_complete_callback:
+                                    threading.Thread(
+                                        target=self.on_recording_complete_callback,
+                                        args=(audio,),
+                                        daemon=True,
+                                    ).start()
+
+                        time.sleep(0.01)
                     except Exception:
-                        continue
-
-                    now = time.time()
-                    if _has_wake_word(text) and now - last_activation >= WAKE_COOLDOWN_SECONDS:
-                        last_activation = now
-                        _beep()
-                        on_activated()
-                except sr.WaitTimeoutError:
-                    continue
-                except Exception as exc:
-                    now = time.time()
-                    if on_error and now - last_error > 10:
-                        on_error(str(exc))
-                        last_error = now
-                    time.sleep(0.1)
-
-    thread = threading.Thread(target=loop, name="aura-wake-word", daemon=True)
-    thread.start()
-    return thread
+                        pass
+            except Exception:
+                time.sleep(2.0)
+            finally:
+                if stream:
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except Exception:
+                        pass
+        p.terminate()
